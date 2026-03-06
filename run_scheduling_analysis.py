@@ -166,6 +166,171 @@ def calculate_extended_metrics(df, total_time, quantum=None):
     gt = metrics['Gini (WT)']
     metrics['Throughput to Gini'] = metrics['Throughput'] / gt if gt > 0 else metrics['Throughput']
 
+    # ===== NEW METRICS =====
+    
+    # 1. Normalized Turnaround Time (NTT) - Mean ratio of turnaround to service time
+    metrics['NTT'] = (df["TurnaroundTime"] / df["processTime"]).mean()
+    
+    # 2. Percentile Metrics for Waiting Time and Response Time
+    metrics['WT P90'] = np.percentile(df["WaitingTime"], 90)
+    metrics['WT P95'] = np.percentile(df["WaitingTime"], 95)
+    metrics['WT P99'] = np.percentile(df["WaitingTime"], 99)
+    metrics['RT P90'] = np.percentile(df["ResponseTime"], 90)
+    metrics['RT P95'] = np.percentile(df["ResponseTime"], 95)
+    metrics['RT P99'] = np.percentile(df["ResponseTime"], 99)
+    
+    # 3. Load Imbalance Factor - Temporal variation in CPU usage
+    # Split timeline into 10 windows and calculate CPU usage per window
+    if makespan > 0 and n > 10:
+        n_windows = 10
+        window_size = makespan / n_windows
+        window_utilizations = []
+        for i in range(n_windows):
+            window_start = first_arrival + i * window_size
+            window_end = window_start + window_size
+            # Count jobs executing during this window
+            window_jobs = df[(df['StartTime'] < window_end) & (df['FinishTime'] > window_start)]
+            window_cpu_time = 0
+            for _, job in window_jobs.iterrows():
+                overlap_start = max(job['StartTime'], window_start)
+                overlap_end = min(job['FinishTime'], window_end)
+                window_cpu_time += max(0, overlap_end - overlap_start)
+            window_util = (window_cpu_time / window_size) * 100 if window_size > 0 else 0
+            window_utilizations.append(window_util)
+        metrics['Load Imbalance Factor'] = np.std(window_utilizations)
+    else:
+        metrics['Load Imbalance Factor'] = 0
+    
+    # 4. Convoy Effect Measure - Average delay caused by long jobs blocking short ones
+    # Identify significantly long jobs (top 10%) and measure delay they cause to short jobs
+    if n > 10:
+        long_threshold = np.percentile(df["processTime"], 90)
+        long_jobs = df[df["processTime"] >= long_threshold]
+        short_jobs = df[df["processTime"] < long_threshold]
+        
+        convoy_delay = 0
+        for _, short_job in short_jobs.iterrows():
+            # Check if short job waited behind long jobs
+            for _, long_job in long_jobs.iterrows():
+                if (short_job['arrivalTime'] > long_job['arrivalTime'] and 
+                    short_job['StartTime'] > long_job['StartTime'] and
+                    short_job['StartTime'] < long_job['FinishTime']):
+                    # Short job waited for long job
+                    convoy_delay += min(long_job['FinishTime'] - short_job['StartTime'], 
+                                       short_job['WaitingTime'])
+        metrics['Convoy Effect'] = convoy_delay / len(short_jobs) if len(short_jobs) > 0 else 0
+    else:
+        metrics['Convoy Effect'] = 0
+    
+    # 5. Response Ratio - (Waiting Time + Service Time) / Service Time - Higher is worse
+    df['ResponseRatio'] = (df['WaitingTime'] + df['processTime']) / df['processTime']
+    metrics['Avg Response Ratio'] = df['ResponseRatio'].mean()
+    metrics['Max Response Ratio'] = df['ResponseRatio'].max()
+    
+    # 6. Scheduling Overhead Percentage - Already calculated, adding explicit metric
+    metrics['Scheduling Overhead (%)'] = (cs_overhead / total_time) * 100 if total_time > 0 else 0
+    
+    # 7. Weighted Turnaround Time - Weighted by priority (higher priority = more weight)
+    priority_weights = df['priority'] / df['priority'].sum() if df['priority'].sum() > 0 else np.ones(n) / n
+    metrics['Weighted TAT'] = (df['TurnaroundTime'] * priority_weights).sum()
+    
+    # 8. Fairness per Priority Class - Calculate JFI for each priority level
+    unique_priorities = df['priority'].unique()
+    if len(unique_priorities) > 1:
+        priority_jfi_values = []
+        for prio in unique_priorities:
+            prio_jobs = df[df['priority'] == prio]
+            if len(prio_jobs) > 1:
+                p_sum_wt = prio_jobs["WaitingTime"].sum()
+                p_sum_sq_wt = (prio_jobs["WaitingTime"]**2).sum()
+                prio_jfi = (p_sum_wt**2) / (len(prio_jobs) * p_sum_sq_wt) if p_sum_sq_wt > 0 else 1.0
+                priority_jfi_values.append(prio_jfi)
+        metrics['Avg JFI Per Priority'] = np.mean(priority_jfi_values) if priority_jfi_values else 1.0
+        metrics['Min JFI Per Priority'] = np.min(priority_jfi_values) if priority_jfi_values else 1.0
+    else:
+        metrics['Avg JFI Per Priority'] = metrics['JFI']
+        metrics['Min JFI Per Priority'] = metrics['JFI']
+    
+    # 9. Time-Weighted Average Queue Depth - More accurate than Little's Law approximation
+    if makespan > 0:
+        # Calculate queue length at each event (arrival/completion)
+        events = []
+        for _, job in df.iterrows():
+            events.append(('arrival', job['arrivalTime']))
+            events.append(('start', job['StartTime']))
+            events.append(('finish', job['FinishTime']))
+        events.sort(key=lambda x: x[1])
+        
+        queue_depth = 0
+        running = 0
+        total_queue_time = 0
+        prev_time = first_arrival
+        
+        for event_type, event_time in events:
+            if event_time > prev_time:
+                total_queue_time += queue_depth * (event_time - prev_time)
+            
+            if event_type == 'arrival':
+                queue_depth += 1
+            elif event_type == 'start':
+                queue_depth -= 1
+                running += 1
+            elif event_type == 'finish':
+                running -= 1
+            
+            prev_time = event_time
+        
+        metrics['Time-Weighted Queue Depth'] = total_queue_time / makespan if makespan > 0 else 0
+    else:
+        metrics['Time-Weighted Queue Depth'] = 0
+    
+    # 10. Predictability Score - Coefficient of variation of normalized turnaround time
+    # Lower is better (more predictable)
+    ntt_array = df["TurnaroundTime"] / df["processTime"]
+    metrics['Predictability CV'] = ntt_array.std() / ntt_array.mean() if ntt_array.mean() > 0 else 0
+    
+    # 11. Stretch Factor (similar to NTT but sometimes defined differently in literature)
+    metrics['Avg Stretch'] = ntt_array.mean()
+    metrics['Max Stretch'] = ntt_array.max()
+    
+    # 12. Service Time Statistics
+    metrics['Service Time Mean'] = df["processTime"].mean()
+    metrics['Service Time Median'] = df["processTime"].median()
+    metrics['Service Time Std'] = df["processTime"].std()
+    metrics['Service Time CV'] = df["processTime"].std() / df["processTime"].mean() if df["processTime"].mean() > 0 else 0
+    
+    # 13. Arrival Rate Statistics
+    if makespan > 0:
+        metrics['Arrival Rate'] = n / makespan
+        inter_arrival_times = df['arrivalTime'].diff().dropna()
+        if len(inter_arrival_times) > 0:
+            metrics['Inter-Arrival Mean'] = inter_arrival_times.mean()
+            metrics['Inter-Arrival CV'] = inter_arrival_times.std() / inter_arrival_times.mean() if inter_arrival_times.mean() > 0 else 0
+        else:
+            metrics['Inter-Arrival Mean'] = 0
+            metrics['Inter-Arrival CV'] = 0
+    else:
+        metrics['Arrival Rate'] = 0
+        metrics['Inter-Arrival Mean'] = 0
+        metrics['Inter-Arrival CV'] = 0
+    
+    # 14. Size-based Fairness - Gini coefficient for different job size categories
+    if n > 10:
+        # Divide jobs into small, medium, large based on process time
+        small_threshold = np.percentile(df["processTime"], 33)
+        large_threshold = np.percentile(df["processTime"], 67)
+        
+        small_jobs_wt = df[df["processTime"] <= small_threshold]["WaitingTime"]
+        large_jobs_wt = df[df["processTime"] >= large_threshold]["WaitingTime"]
+        
+        metrics['Small Jobs Avg WT'] = small_jobs_wt.mean() if len(small_jobs_wt) > 0 else 0
+        metrics['Large Jobs Avg WT'] = large_jobs_wt.mean() if len(large_jobs_wt) > 0 else 0
+        metrics['Size Fairness Ratio'] = (small_jobs_wt.mean() / large_jobs_wt.mean()) if len(large_jobs_wt) > 0 and large_jobs_wt.mean() > 0 else 1.0
+    else:
+        metrics['Small Jobs Avg WT'] = metrics['AWT']
+        metrics['Large Jobs Avg WT'] = metrics['AWT']
+        metrics['Size Fairness Ratio'] = 1.0
+
     return metrics
 
 def fcfs_schedule(df_in):
@@ -408,7 +573,11 @@ def run_analysis():
     metrics_to_plot = [
         'AWT', 'Response Time', 'Bounded Slowdown', 'Max Bounded Slowdown', 'WT Variance', 'WT CV', 'JFI', 'Starvation Rate (%)', 
         'Makespan', 'Average Queue Length', 'MWT', 'Preemption Frequency', 'Priority Inversion Potential',
-        'Fairness Bias (Corr)', 'Throughput to Gini', 'Task Switching Eff (%)'
+        'Fairness Bias (Corr)', 'Throughput to Gini', 'Task Switching Eff (%)',
+        # New metrics
+        'NTT', 'WT P95', 'RT P95', 'Load Imbalance Factor', 'Convoy Effect', 'Avg Response Ratio',
+        'Weighted TAT', 'Avg JFI Per Priority', 'Time-Weighted Queue Depth', 'Predictability CV',
+        'Avg Stretch', 'Service Time CV', 'Inter-Arrival CV', 'Size Fairness Ratio'
     ]
     
     if not os.path.exists("images"):
