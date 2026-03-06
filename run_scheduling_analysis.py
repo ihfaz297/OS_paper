@@ -71,11 +71,14 @@ def calculate_extended_metrics(df, total_time, quantum=None):
     metrics['WT Variance'] = df["WaitingTime"].var() if len(df) > 1 else 0
     metrics['WT CV'] = df["WaitingTime"].std() / df["WaitingTime"].mean() if df["WaitingTime"].mean() > 0 else 0
     metrics['MWT'] = df["WaitingTime"].max()
-    metrics['MWT'] = df["WaitingTime"].max()
     metrics['Throughput'] = len(df) / total_time if total_time > 0 else 0
     
     total_burst = df["processTime"].sum()
     metrics['CPU Utilization (%)'] = (total_burst / total_time) * 100 if total_time > 0 else 0
+    
+    makespan = df["FinishTime"].max() - df["arrivalTime"].min()
+    metrics['Makespan'] = makespan if makespan > 0 else 0
+    metrics['Average Queue Length'] = (len(df) / makespan) * metrics['AWT'] if makespan > 0 else 0
     
     # 2. Resource waste/idle time
     first_arrival = df["arrivalTime"].min()
@@ -404,7 +407,7 @@ def run_analysis():
     # Generate Plots
     metrics_to_plot = [
         'AWT', 'Response Time', 'Bounded Slowdown', 'Max Bounded Slowdown', 'WT Variance', 'WT CV', 'JFI', 'Starvation Rate (%)', 
-        'MWT', 'Preemption Frequency', 'Priority Inversion Potential',
+        'Makespan', 'Average Queue Length', 'MWT', 'Preemption Frequency', 'Priority Inversion Potential',
         'Fairness Bias (Corr)', 'Throughput to Gini', 'Task Switching Eff (%)'
     ]
     
